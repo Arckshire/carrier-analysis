@@ -72,7 +72,7 @@ COLUMN_ALIASES = {
     'dropoff_name':             ['drop-off name', 'dropoff name', 'drop off name', 'delivery name', 'destination name'],
     'dropoff_city_state':       ['drop-off city state', 'drop-off city, state', 'dropoff city state', 'drop off city, state', 'destination city state'],
     'dropoff_country':          ['drop-off country', 'dropoff country', 'destination country'],
-    'dropoff_region':           ['drop-off region', 'dropoff region', 'destination region'],
+    'dropoff_region':           ['drop-off region', 'dropoff region', 'destination region', 'dropoff country region', 'drop-off country region'],
     'final_status_reason':      ['final status reason', 'status reason'],
     'created_timestamp_date':   ['created timestamp date', 'created timestamp', 'created date'],
     'pickup_arrival':           ['pickup arrival utc timestamp raw', 'pickup arrival', 'pickup arrival utc', 'pickup arrival timestamp'],
@@ -86,12 +86,17 @@ COLUMN_ALIASES = {
 # ============================================================
 
 def normalize(s):
-    """Lowercase, strip non-alphanumeric, collapse whitespace."""
+    """Lowercase, strip non-alphanumeric, collapse whitespace, and canonicalize
+    common compound words ('drop off'/'drop-off'/'dropoff' all → 'dropoff';
+    'pick up'/'pick-up'/'pickup' all → 'pickup')."""
     if pd.isna(s):
         return ''
     s = str(s).lower().strip()
     s = re.sub(r'[^a-z0-9]+', ' ', s)
     s = re.sub(r'\s+', ' ', s).strip()
+    # Canonicalize compound words so spelling variants collapse together
+    s = re.sub(r'\bdrop\s?off\b', 'dropoff', s)
+    s = re.sub(r'\bpick\s?up\b', 'pickup', s)
     return s
 
 
@@ -874,9 +879,15 @@ def main():
                     for k, v in col_map.items()
                 ])
                 st.dataframe(map_df, use_container_width=True, hide_index=True)
+
                 missing_optional = [k for k in COLUMN_ALIASES if k not in col_map]
                 if missing_optional:
-                    st.caption(f"Not found (may not exist in this export): {', '.join(missing_optional)}")
+                    st.caption(f"⚠️ Canonical fields not found in file: {', '.join(missing_optional)}")
+
+                mapped_actual = set(col_map.values())
+                unmapped_file_cols = [c for c in df.columns if c not in mapped_actual]
+                if unmapped_file_cols:
+                    st.caption(f"ℹ️ File columns not used by analysis (e.g. attributes, latency stats): {', '.join(unmapped_file_cols)}")
 
             st.success(f"Loaded {len(df)} rows. "
                        f"Carrier: **{st.session_state.carrier_name}**, "
