@@ -694,13 +694,33 @@ def render_examples_table(df, col_map, key_prefix=''):
 def issue_logger(phase_key, bucket_label=None):
     """Render the issue logging widget. Issues stored in state[phase_key+'_issues']."""
     state_key = f'{phase_key}_issues'
+    counter_key = f'{phase_key}_form_counter'
+    last_save_key = f'{phase_key}_last_save_msg'
+
     if state_key not in st.session_state:
         st.session_state[state_key] = []
+    if counter_key not in st.session_state:
+        st.session_state[counter_key] = 0
+
+    issues = st.session_state[state_key]
+    counter = st.session_state[counter_key]
+
+    # Show persistent success/error message from the previous save attempt
+    pending_msg = st.session_state.get(last_save_key)
+    if pending_msg:
+        msg_type, msg_text = pending_msg
+        if msg_type == 'success':
+            st.success(msg_text)
+        elif msg_type == 'warning':
+            st.warning(msg_text)
+        else:
+            st.error(msg_text)
+        # Keep the message visible for the current render only
+        del st.session_state[last_save_key]
 
     # Display existing issues
-    issues = st.session_state[state_key]
     if issues:
-        st.markdown("##### Logged issues")
+        st.markdown(f"##### Logged issues ({len(issues)})")
         for i, issue in enumerate(issues):
             with st.expander(f"Issue {i+1}: {issue.get('title') or '(untitled)'}", expanded=False):
                 st.write(f"**Description:** {issue.get('description', '')}")
@@ -710,46 +730,92 @@ def issue_logger(phase_key, bucket_label=None):
                     st.write(f"**BOLs:** {', '.join(issue['bols'])}")
                 if issue.get('screenshots'):
                     for img_bytes, img_name in issue['screenshots']:
-                        st.image(img_bytes, caption=img_name, width=400)
+                        try:
+                            st.image(img_bytes, caption=img_name, width=400)
+                        except Exception:
+                            st.caption(f"[Could not display {img_name}]")
                 if st.button("Delete this issue", key=f"del_{phase_key}_{i}"):
                     st.session_state[state_key].pop(i)
                     st.rerun()
 
-    # New issue form
-    with st.expander("➕ Log a new issue", expanded=False):
-        with st.form(key=f'{phase_key}_form_{len(issues)}', clear_on_submit=True):
-            title = st.text_input("Issue title (short)", key=f'title_{phase_key}')
-            description = st.text_area("Description (what's the problem, what's likely the cause)",
-                                        height=120, key=f'desc_{phase_key}')
-            bols_raw = st.text_area("Evidence BOLs (one per line, or comma-separated)",
-                                     height=80, key=f'bols_{phase_key}')
+    # New issue form - counter-based widget keys ensure clean reset after each save
+    auto_expand = (len(issues) == 0)
+    with st.expander("➕ Log a new issue", expanded=auto_expand):
+        with st.form(key=f'{phase_key}_form_{counter}', clear_on_submit=False):
+            title = st.text_input(
+                "Issue title (short)",
+                key=f'title_{phase_key}_{counter}'
+            )
+            description = st.text_area(
+                "Description (what's the problem, what's likely the cause)",
+                height=120,
+                key=f'desc_{phase_key}_{counter}'
+            )
+            bols_raw = st.text_area(
+                "Evidence BOLs (one per line, or comma-separated)",
+                height=80,
+                key=f'bols_{phase_key}_{counter}'
+            )
             screenshots = st.file_uploader(
                 "Screenshots (optional, multiple allowed)",
                 type=['png', 'jpg', 'jpeg'],
                 accept_multiple_files=True,
-                key=f'shots_{phase_key}'
+                key=f'shots_{phase_key}_{counter}'
             )
-            submitted = st.form_submit_button("Save issue")
+            submitted = st.form_submit_button("💾 Save issue", type='primary')
 
             if submitted:
-                if not title and not description:
-                    st.error("Add at least a title or description.")
+                if not title.strip() and not description.strip():
+                    st.error("Please add at least a title or description before saving.")
                 else:
-                    bols = [b.strip() for b in re.split(r'[,\n]', bols_raw) if b.strip()]
-                    shot_data = []
-                    for s in (screenshots or []):
-                        shot_data.append((s.read(), s.name))
-                    new_issue = {
-                        'title': title.strip(),
-                        'description': description.strip(),
-                        'bols': bols,
-                        'screenshots': shot_data,
-                    }
-                    if bucket_label:
-                        new_issue['bucket_label'] = bucket_label
-                    st.session_state[state_key].append(new_issue)
-                    st.success("Issue saved.")
-                    st.rerun()
+                    try:
+                        # Parse BOLs (split on commas or newlines)
+                        bols = [b.strip() for b in re.split(r'[,\n]', bols_raw) if b.strip()]
+
+                        # Read all uploaded screenshots, capturing per-file errors
+                        shot_data = []
+                        upload_errors = []
+                        for s in (screenshots or []):
+                            try:
+                                data = s.read()
+                                if data and len(data) > 0:
+                                    shot_data.append((data, s.name))
+                                else:
+                                    upload_errors.append(f"{s.name} (empty)")
+                            except Exception as e:
+                                upload_errors.append(f"{s.name}: {type(e).__name__}")
+
+                        # Build and append the issue
+                        new_issue = {
+                            'title': title.strip(),
+                            'description': description.strip(),
+                            'bols': bols,
+                            'screenshots': shot_data,
+                        }
+                        if bucket_label:
+                            new_issue['bucket_label'] = bucket_label
+
+                        st.session_state[state_key].append(new_issue)
+                        st.session_state[counter_key] += 1
+
+                        # Build feedback message that will survive the rerun
+                        total = len(st.session_state[state_key])
+                        msg = (f"✅ Issue saved. Total in this phase: **{total}**. "
+                               f"Attached: {len(bols)} BOL(s), {len(shot_data)} screenshot(s).")
+                        if upload_errors:
+                            msg += f" ⚠️ Upload issues: {', '.join(upload_errors)}"
+                            st.session_state[last_save_key] = ('warning', msg)
+                        else:
+                            st.session_state[last_save_key] = ('success', msg)
+
+                        st.rerun()
+                    except Exception as e:
+                        import traceback
+                        err_msg = f"❌ Failed to save issue: {type(e).__name__}: {e}"
+                        st.session_state[last_save_key] = ('error', err_msg)
+                        st.error(err_msg)
+                        with st.expander("Error details"):
+                            st.code(traceback.format_exc())
 
 
 # ============================================================
@@ -1029,7 +1095,13 @@ def main():
             label = b['label']
             with st.expander(f"{label} — **{b['count']}** shipments", expanded=(i == 0 and not is_complete)):
                 if is_complete:
-                    st.success("These shipments have all 4 milestones. No issue to investigate here.")
+                    st.success(
+                        "✨ These shipments have all 4 milestones — useful as **ideal examples** "
+                        "to reference in carrier emails ('this is what good looks like')."
+                    )
+                    st.markdown(f"**Examples (up to {EXAMPLE_COUNT_MILESTONE}):**")
+                    ex = b['data'].head(EXAMPLE_COUNT_MILESTONE)
+                    render_examples_table(ex, col_map, f'bucket_{i}')
                     continue
 
                 # Pattern hints for this bucket
