@@ -624,6 +624,12 @@ def build_docx(state, col_map):
     if not tracking_issues and not milestone_issues:
         doc.add_paragraph('No issues were logged during this analysis.')
 
+    # Next Steps section
+    next_steps = state.get('next_steps', '').strip() if hasattr(state, 'get') else ''
+    if next_steps:
+        doc.add_heading('Next Steps', 1)
+        doc.add_paragraph(next_steps)
+
     # Save to bytes
     buf = io.BytesIO()
     doc.save(buf)
@@ -654,6 +660,7 @@ def build_progress_json(state):
             }
             for i in state.get('milestone_issues', [])
         ],
+        'next_steps': state.get('next_steps', ''),
         'phase': state.get('phase', 'tracking'),
     }
     return json.dumps(out, indent=2).encode('utf-8')
@@ -834,6 +841,7 @@ def main():
         'milestone_summary': None,
         'tracking_issues': [],
         'milestone_issues': [],
+        'next_steps': '',
         'carrier_name': None,
         'tenant_name': None,
     }
@@ -875,17 +883,26 @@ def main():
             uploaded_progress = st.file_uploader("Restore progress from JSON", type=['json'],
                                                   key='progress_restore')
             if uploaded_progress:
-                try:
-                    data = json.loads(uploaded_progress.read())
-                    st.session_state.tracking_issues = [
-                        {**i, 'screenshots': []} for i in data.get('tracking_issues', [])
-                    ]
-                    st.session_state.milestone_issues = [
-                        {**i, 'screenshots': []} for i in data.get('milestone_issues', [])
-                    ]
-                    st.success("Progress restored. (Screenshots not restored — re-upload if needed.)")
-                except Exception as e:
-                    st.error(f"Could not parse progress file: {e}")
+                # Only process once per uploaded file - prevents silent re-restoration
+                # on every rerun, which could otherwise wipe out live work.
+                file_id = getattr(uploaded_progress, 'file_id', None) or \
+                          f"{uploaded_progress.name}:{uploaded_progress.size}"
+                if st.session_state.get('_last_restored_progress') != file_id:
+                    try:
+                        uploaded_progress.seek(0)
+                        data = json.loads(uploaded_progress.read())
+                        st.session_state.tracking_issues = [
+                            {**i, 'screenshots': []} for i in data.get('tracking_issues', [])
+                        ]
+                        st.session_state.milestone_issues = [
+                            {**i, 'screenshots': []} for i in data.get('milestone_issues', [])
+                        ]
+                        if 'next_steps' in data:
+                            st.session_state.next_steps = data['next_steps']
+                        st.session_state['_last_restored_progress'] = file_id
+                        st.success("Progress restored. (Screenshots not restored — re-upload if needed.)")
+                    except Exception as e:
+                        st.error(f"Could not parse progress file: {e}")
 
         st.markdown("---")
         if st.button("🔄 Reset everything"):
@@ -1135,6 +1152,13 @@ def main():
                 st.rerun()
         with col_b:
             if st.button("Generate final notes →", type='primary'):
+                # Defensive snapshot — guarantees the export phase has the issues
+                # that were live at the moment of clicking, even if anything
+                # else mutates state on subsequent reruns.
+                st.session_state['_export_snapshot'] = {
+                    'tracking_issues': list(st.session_state.tracking_issues),
+                    'milestone_issues': list(st.session_state.milestone_issues),
+                }
                 st.session_state.phase = 'export'
                 st.rerun()
 
@@ -1142,8 +1166,64 @@ def main():
     elif st.session_state.phase == 'export':
         st.header("Final notes & email prompt")
 
+        # Reconcile state: prefer snapshot if it has more issues than live state
+        # (this protects against any spurious wipes between phases).
+        snapshot = st.session_state.get('_export_snapshot') or {}
+        snap_ti = snapshot.get('tracking_issues', [])
+        snap_mi = snapshot.get('milestone_issues', [])
+        live_ti = st.session_state.tracking_issues
+        live_mi = st.session_state.milestone_issues
+
+        if len(snap_ti) > len(live_ti):
+            st.session_state.tracking_issues = snap_ti
+            st.warning(f"Restored {len(snap_ti)} tracking issue(s) from snapshot.")
+        if len(snap_mi) > len(live_mi):
+            st.session_state.milestone_issues = snap_mi
+            st.warning(f"Restored {len(snap_mi)} milestone issue(s) from snapshot.")
+
+        # Diagnostic panel (collapsible, but visible by default if issue count seems off)
+        ti = st.session_state.tracking_issues
+        mi = st.session_state.milestone_issues
+        with st.expander("🔍 State diagnostics", expanded=(not ti and not mi)):
+            st.write(f"**Tracking issues in state:** {len(ti)}")
+            for i, x in enumerate(ti, 1):
+                st.caption(f"  {i}. {x.get('title') or '(untitled)'} — "
+                          f"{len(x.get('bols', []))} BOLs, "
+                          f"{len(x.get('screenshots', []))} screenshots")
+            st.write(f"**Milestone issues in state:** {len(mi)}")
+            for i, x in enumerate(mi, 1):
+                bucket = f" [{x.get('bucket_label')}]" if x.get('bucket_label') else ''
+                st.caption(f"  {i}. {x.get('title') or '(untitled)'}{bucket} — "
+                          f"{len(x.get('bols', []))} BOLs, "
+                          f"{len(x.get('screenshots', []))} screenshots")
+            if snapshot:
+                st.caption(f"Snapshot present: {len(snap_ti)} tracking, {len(snap_mi)} milestone.")
+
+        st.markdown("---")
+
+        # Next Steps field — captured before generating notes
+        st.subheader("📌 Next steps (optional)")
+        st.caption("Summarize the action items / next steps for this carrier. "
+                   "This will be included in the one-pager.")
+        next_steps = st.text_area(
+            "Next steps",
+            value=st.session_state.get('next_steps', ''),
+            height=120,
+            label_visibility='collapsed',
+            placeholder="e.g. (1) Schedule call with carrier ops to walk through ELD device "
+                        "issues; (2) Confirm whether direct-push API supports milestone webhooks; "
+                        "(3) Re-run analysis next month to verify improvement.",
+            key='next_steps_input'
+        )
+        # Persist as the user types (Streamlit reruns on widget interaction)
+        st.session_state.next_steps = next_steps
+
+        st.markdown("---")
+
+        # Download
         st.subheader("📄 Download one-pager")
-        st.write("Carrier-specific document with all logged issues, BOLs, and screenshots embedded.")
+        st.write("Carrier-specific document with all logged issues, BOLs, screenshots, "
+                 "and next steps embedded.")
 
         carrier = st.session_state.get('carrier_name') or 'carrier'
         safe_name = re.sub(r'[^a-zA-Z0-9_-]+', '_', str(carrier))
@@ -1160,11 +1240,15 @@ def main():
             )
         except Exception as e:
             st.error(f"Could not build document: {e}")
+            import traceback
+            with st.expander("Error details"):
+                st.code(traceback.format_exc())
 
         st.markdown("---")
 
         st.subheader("📋 Reusable email-drafting prompt")
-        st.write("Copy this prompt and feed it (along with the .docx above) to a new Claude chat to draft the carrier email.")
+        st.write("Copy this prompt and feed it (along with the .docx above) to a new Claude chat "
+                 "to draft the carrier email.")
         st.code(EMAIL_PROMPT_TEMPLATE, language='text')
         st.caption("This prompt stays the same for every carrier — only the attached document changes.")
 
@@ -1172,8 +1256,6 @@ def main():
 
         # Quick summary view
         st.subheader("Summary of logged issues")
-        ti = st.session_state.tracking_issues
-        mi = st.session_state.milestone_issues
         if not ti and not mi:
             st.info("No issues were logged during this analysis.")
         else:
@@ -1186,6 +1268,9 @@ def main():
                 for i, x in enumerate(mi, 1):
                     label = f" [{x['bucket_label']}]" if x.get('bucket_label') else ''
                     st.write(f"{i}. {x.get('title') or '(untitled)'}{label}")
+            if st.session_state.get('next_steps', '').strip():
+                st.markdown("**Next steps:**")
+                st.write(st.session_state.next_steps)
 
         st.markdown("---")
         col_a, col_b = st.columns(2)
